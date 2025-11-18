@@ -9,15 +9,29 @@ services:
       - "5001:5000"
     volumes:
       - user-files:/app/storage
+      # RMAP server and client keys mounted read only into the container
+      - ./rmap/server:/app/rmap/server:ro
+      - ./rmap/clients:/app/rmap/clients:ro
     environment:
       - PYTHONUNBUFFERED=1
-      # DB connection details for future use by the API
+      # DB connection details for the API
       - DB_HOST=db
       - DB_PORT=3306
       - DB_NAME=tatou
       - DB_USER=tatouuser
       - DB_PASSWORD=tatoupass
+      # Provided flag env
       - FLAG_2=8a9af3f59df055bc28f0727602b757db96f45a87
+      # RMAP configuration
+      - RMAP_ENABLE=1
+      - RMAP_SERVER_PRIV=/app/rmap/server/server_private.pem
+      - RMAP_SERVER_PUB=/app/rmap/server/server_public.pem
+      - RMAP_CLIENT_KEYS_DIR=/app/rmap/clients
+      # Base document id to watermark for RMAP
+      # You will update this value once you know the real id
+      - RMAP_DOCUMENT_ID=1
+      # Optional, only if your server private key is encrypted
+      # - RMAP_SERVER_PRIV_PASSPHRASE=your_passphrase_here
     depends_on:
       db:
         condition: service_healthy
@@ -48,7 +62,7 @@ services:
     environment:
       - PMA_HOST=db
       - PMA_PORT=3306
-      - UPLOAD_LIMIT=64M     # <-- use a unit and quote if using YAML key:value form
+      - UPLOAD_LIMIT=64M     # use a unit and quote if using YAML key:value form
       - MEMORY_LIMIT=256M
     ports:
       - "8080:80"
