@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   server:
     build:
@@ -14,7 +12,7 @@ services:
       - ./rmap/clients:/app/rmap/clients:ro
     environment:
       - PYTHONUNBUFFERED=1
-      # DB connection details for the API
+      # Database connection used by the server INSIDE the Docker network
       - DB_HOST=db
       - DB_PORT=3306
       - DB_NAME=tatou
@@ -27,8 +25,7 @@ services:
       - RMAP_SERVER_PRIV=/app/rmap/server/server_private.pem
       - RMAP_SERVER_PUB=/app/rmap/server/server_public.pem
       - RMAP_CLIENT_KEYS_DIR=/app/rmap/clients
-      # Base document id to watermark for RMAP
-      # You will update this value once you know the real id
+      # Base document id to watermark for RMAP (placeholder, update later)
       - RMAP_DOCUMENT_ID=1
       # Optional, only if your server private key is encrypted
       # - RMAP_SERVER_PRIV_PASSPHRASE=your_passphrase_here
@@ -53,8 +50,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    # Expose database on host port 3307 to avoid conflict with local MySQL
     ports:
-      - "3306:3306"
+      - "3307:3306"
     restart: unless-stopped
 
   phpmyadmin:
@@ -62,7 +60,7 @@ services:
     environment:
       - PMA_HOST=db
       - PMA_PORT=3306
-      - UPLOAD_LIMIT=64M     # use a unit and quote if using YAML key:value form
+      - UPLOAD_LIMIT=64M
       - MEMORY_LIMIT=256M
     ports:
       - "8080:80"
