@@ -45,6 +45,7 @@ from watermarking_method import (
 from custom_eof_watermark import CustomEOFWatermark
 from add_after_eof import AddAfterEOF
 from unsafe_bash_bridge_append_eof import UnsafeBashBridgeAppendEOF
+from custom_hidden_text_watermark import HiddenTextWatermark
 
 # --------------------
 # Method registry
@@ -54,7 +55,7 @@ METHODS: Dict[str, WatermarkingMethod] = {
     AddAfterEOF.name: AddAfterEOF(),
     UnsafeBashBridgeAppendEOF.name: UnsafeBashBridgeAppendEOF(),
     #CustomEOFWatermark.name: CustomEOFWatermark(),  # Use our custom byte-level watermark
-    "hidden_text": HiddenTextWatermark(),
+    HiddenTextWatermark.name: HiddenTextWatermark(),
 }
 """Registry of available watermarking methods.
 
