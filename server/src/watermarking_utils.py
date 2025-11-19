@@ -53,7 +53,8 @@ from unsafe_bash_bridge_append_eof import UnsafeBashBridgeAppendEOF
 METHODS: Dict[str, WatermarkingMethod] = {
     AddAfterEOF.name: AddAfterEOF(),
     UnsafeBashBridgeAppendEOF.name: UnsafeBashBridgeAppendEOF(),
-    CustomEOFWatermark.name: CustomEOFWatermark(),  # Use our custom byte-level watermark
+    #CustomEOFWatermark.name: CustomEOFWatermark(),  # Use our custom byte-level watermark
+    "hidden_text": HiddenTextWatermark(),
 }
 """Registry of available watermarking methods.
 
