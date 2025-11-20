@@ -22,11 +22,12 @@ services:
       - FLAG_2=8a9af3f59df055bc28f0727602b757db96f45a87
       # RMAP configuration
       - RMAP_ENABLE=1
-      - RMAP_SERVER_PRIV=/app/rmap/server/server_private.pem
-      - RMAP_SERVER_PUB=/app/rmap/server/server_public.pem
+      - RMAP_SERVER_PRIV=/app/rmap/server/server_priv.asc
+      - RMAP_SERVER_PUB=/app/rmap/server/server_pub.asc
       - RMAP_CLIENT_KEYS_DIR=/app/rmap/clients
       # Base document id to watermark for RMAP (placeholder, update later)
       - RMAP_DOCUMENT_ID=1
+      - RMAP_WATERMARK_METHOD=hidden_text
       # Optional, only if your server private key is encrypted
       # - RMAP_SERVER_PRIV_PASSPHRASE=your_passphrase_here
     depends_on:
