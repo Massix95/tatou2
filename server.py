@@ -7,7 +7,7 @@ from functools import wraps
 import logging
 from logging.handlers import RotatingFileHandler
 
-from flask import Flask, jsonify, request, g, send_file
+from flask import Flask, jsonify, request, g, send_file, url_for
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
