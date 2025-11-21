@@ -1,11 +1,9 @@
 import os
-import json
+import io
 import hashlib
 import datetime as dt
 from pathlib import Path
 from functools import wraps
-import logging
-from logging.handlers import RotatingFileHandler
 
 from flask import Flask, jsonify, request, g, send_file, url_for
 from werkzeug.utils import secure_filename
@@ -15,56 +13,22 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
-# RMAP (v2)
-from rmap.identity_manager import IdentityManager
-from rmap.rmap import RMAP
-
 import pickle as _std_pickle
 try:
     import dill as _pickle  # allows loading classes not importable by module path
-except Exception:
+except Exception:  # dill is optional
     _pickle = _std_pickle
+
 
 import watermarking_utils as WMUtils
 from watermarking_method import WatermarkingMethod
+# from watermarking_utils import METHODS, apply_watermark, read_watermark, explore_pdf, is_watermarking_applicable, get_method
 
 
 def create_app():
     app = Flask(__name__)
 
-    # =========================
-    # Security headers
-    # =========================
-    @app.after_request
-    def add_security_headers(response):
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Cache-Control"] = "no-store"
-        return response
-
-    # =========================
-    # Logging
-    # =========================
-    log_dir = Path("./storage/logs")
-    log_dir.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(log_dir / "server.log", maxBytes=5_000_000, backupCount=5)
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    handler.setFormatter(formatter)
-    app.logger.addHandler(handler)
-    app.logger.setLevel(logging.INFO)
-
-    @app.before_request
-    def log_request_info():
-        xff = request.headers.get("X-Forwarded-For", "") or ""
-        xri = request.headers.get("X-Real-IP", "") or ""
-        real_ip = (xff.split(",")[0].strip() if xff else (xri or request.remote_addr))
-        app.logger.info(f"ClientIP={real_ip} {request.method} {request.path}")
-
-    # =========================
-    # Config
-    # =========================
+    # --- Config ---
     app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
     app.config["STORAGE_DIR"] = Path(os.environ.get("STORAGE_DIR", "./storage")).resolve()
     app.config["TOKEN_TTL_SECONDS"] = int(os.environ.get("TOKEN_TTL_SECONDS", "86400"))
@@ -75,11 +39,19 @@ def create_app():
     app.config["DB_PORT"] = int(os.environ.get("DB_PORT", "3306"))
     app.config["DB_NAME"] = os.environ.get("DB_NAME", "tatou")
 
+    # RMAP configuration
+    app.config["RMAP_ENABLE"] = os.environ.get("RMAP_ENABLE", "0") in ("1", "true", "True")
+    app.config["RMAP_CLIENT_KEYS_DIR"] = os.environ.get("RMAP_CLIENT_KEYS_DIR", "/app/rmap/clients")
+    app.config["RMAP_SERVER_PRIV"] = os.environ.get("RMAP_SERVER_PRIV", "/app/rmap/server/server_private.pem")
+    app.config["RMAP_SERVER_PUB"] = os.environ.get("RMAP_SERVER_PUB", "/app/rmap/server/server_public.pem")
+    app.config["RMAP_SERVER_PRIV_PASSPHRASE"] = os.environ.get("RMAP_SERVER_PRIV_PASSPHRASE")
+    app.config["RMAP_DOCUMENT_ID"] = os.environ.get("RMAP_DOCUMENT_ID")
+    app.config["RMAP_WATERMARK_METHOD"] = os.environ.get("RMAP_WATERMARK_METHOD", "gulshan")
+    app.config["RMAP_WATERMARK_KEY"] = os.environ.get("RMAP_WATERMARK_KEY", app.config["SECRET_KEY"])
+
     app.config["STORAGE_DIR"].mkdir(parents=True, exist_ok=True)
 
-    # =========================
-    # DB engine
-    # =========================
+    # --- DB engine only (no Table metadata) ---
     def db_url() -> str:
         return (
             f"mysql+pymysql://{app.config['DB_USER']}:{app.config['DB_PASSWORD']}"
@@ -93,24 +65,7 @@ def create_app():
             app.config["_ENGINE"] = eng
         return eng
 
-    # =========================
-    # RMAP init (ONE instance)
-    # =========================
-    try:
-        app.logger.info("Initializing RMAP...")
-        clients_dir = "/app/server/src/rmap/pki/clients"
-        server_pub = "/app/server/src/rmap/pki/server_pub.asc"
-        server_priv = "/app/server/src/rmap/pki/server_priv.asc"
-        im = IdentityManager(clients_dir, server_pub, server_priv)
-        app.config["_RMAP"] = RMAP(im)
-        app.logger.info("RMAP successfully initialized.")
-    except Exception as e:
-        app.logger.error(f"Failed to initialize RMAP: {e}")
-        app.config["_RMAP"] = None
-
-    # =========================
-    # Helpers
-    # =========================
+    # --- Helpers ---
     def _serializer():
         return URLSafeTimedSerializer(app.config["SECRET_KEY"], salt="tatou-auth")
 
@@ -141,12 +96,45 @@ def create_app():
                 h.update(chunk)
         return h.hexdigest()
 
-    # =========================
-    # Base routes
-    # =========================
+    # Helper to ensure a path stays under a given root
+    def _safe_resolve_under_storage(p: str, storage_root: Path) -> Path:
+        storage_root = storage_root.resolve()
+        fp = Path(p)
+        if not fp.is_absolute():
+            fp = storage_root / fp
+        fp = fp.resolve()
+        if hasattr(fp, "is_relative_to"):
+            if not fp.is_relative_to(storage_root):
+                raise RuntimeError(f"path {fp} escapes storage root {storage_root}")
+        else:
+            try:
+                fp.relative_to(storage_root)
+            except ValueError:
+                raise RuntimeError(f"path {fp} escapes storage root {storage_root}")
+        return fp
+
+    # Ensure wm_key column exists if we use it later
+    def _ensure_wm_key_column():
+        try:
+            with get_engine().connect() as conn:
+                conn.execute(
+                    text("""
+                        ALTER TABLE Versions
+                        ADD COLUMN wm_key VARCHAR(255) NULL
+                    """)
+                )
+        except Exception:
+            # If it already exists or fails we simply ignore
+            pass
+
+    # --- Static and health routes ---
+    @app.route("/<path:filename>")
+    def static_files(filename):
+        return app.send_static_file(filename)
+
     @app.route("/")
     def home():
-        return jsonify({"message": "Tatou Server Running"}), 200
+        return app.send_static_file("index.html")
 
     @app.get("/healthz")
     def healthz():
@@ -156,165 +144,10 @@ def create_app():
             db_ok = True
         except Exception:
             db_ok = False
-        return jsonify({"message": "Server is running", "db_connected": db_ok}), 200
+        return jsonify({"message": "The server is up and running.", "db_connected": db_ok}), 200
 
-    # ===========================================
-# RMAP HANDSHAKE ENDPOINTS
-# ===========================================
+    # --- Auth and user management ---
 
-   @app.post("/api/rmap-initiate")
-   def rmap_initiate():
-    """
-    Step 1 of the RMAP protocol:
-    Accepts RMAP Message 1 (encrypted payload), validates
-    the identity against known public keys, and returns Response 1.
-    """
-    app.logger.info("RMAP: Received initiation request")
-
-    if app.config.get("_RMAP") is None:
-        return jsonify({"error": "RMAP not initialized"}), 500
-
-    msg = request.get_json(silent=True) or {}
-    if not isinstance(msg, dict) or not msg.get("payload"):
-        return jsonify({"error": "missing payload"}), 400
-
-    try:
-        # Handle first RMAP message (nonceClient, identity)
-        resp1 = app.config["_RMAP"].handle_message1(msg)
-        app.logger.info("RMAP: Message 1 processed successfully")
-        return jsonify(resp1), 200
-
-    except Exception as e:
-        app.logger.error(f"RMAP initiation error: {e}")
-        return jsonify({"error": f"RMAP initiation error: {e}"}), 400
-
-    @app.post("/api/rmap-get-link")
-def rmap_get_link():
-    """
-    Step 2 of the RMAP protocol:
-    Accepts RMAP Message 2 (encrypted payload) and returns a secret link.
-    The server watermarks a PDF with that secret and records the entry in the database.
-    """
-    app.logger.info("RMAP: Received get-link request")
-
-    # -------------------------------
-    # Extract payload
-    # -------------------------------
-    payload = (request.get_json(silent=True) or {}).get("payload")
-    if not payload:
-        return jsonify({"error": "missing payload"}), 400
-
-    # -------------------------------
-    # Get active RMAP instance
-    # -------------------------------
-    rmap = app.config.get("_RMAP")
-    if rmap is None:
-        app.logger.error("RMAP instance not initialized")
-        return jsonify({"error": "RMAP not initialized"}), 500
-
-    try:
-        # -------------------------------
-        # Handle Message 2 (compatibility-safe)
-        # -------------------------------
-        response = rmap.handle_message2({"payload": payload})
-        if isinstance(response, tuple):
-            result, identity = response
-        else:
-            result = response
-            identity = "unknown"
-
-        secret_link = result.get("result") if isinstance(result, dict) else result
-        if not secret_link:
-            raise ValueError("Failed to generate secret link")
-
-        app.logger.info(f"RMAP: identity={identity or 'unknown'}, link={secret_link}")
-
-        # -------------------------------
-        # Apply watermark to base PDF
-        # -------------------------------
-        base_pdf = "/app/server/src/rmap/base_document.pdf"  # Teacher-provided document
-        wm_bytes = WMUtils.apply_watermark(
-            pdf=base_pdf,
-            secret=secret_link,
-            key="rmap-session",
-            method="metadata",
-        )
-
-        # -------------------------------
-        # Save new watermarked version
-        # -------------------------------
-        downloads_dir = Path("/home/lab/Tatou-2/tatou/downloads")
-        downloads_dir.mkdir(parents=True, exist_ok=True)
-        out_path = downloads_dir / f"{identity or 'unknown'}_{secret_link}.pdf"
-        with out_path.open("wb") as f:
-            f.write(wm_bytes)
-        app.logger.info(f"Saved watermarked PDF: {out_path}")
-
-        # -------------------------------
-        # Database entry (Versions table)
-        # -------------------------------
-        try:
-            with get_engine().begin() as conn:
-                documentid = 65  # The teacher-provided base document
-
-                conn.execute(text("""
-                    INSERT INTO Versions (documentid, link, intended_for, secret, method, position, path)
-                    VALUES (:documentid, :link, :intended_for, :secret, :method, :position, :path)
-                """), {
-                    "documentid": documentid,
-                    "link": secret_link,
-                    "intended_for": identity or "unknown",
-                    "secret": secret_link,
-                    "method": "metadata",
-                    "position": "",
-                    "path": str(out_path)
-                })
-
-            app.logger.info(f"RMAP: Stored watermarked PDF entry for {identity or 'unknown'} (documentid={documentid})")
-
-        except Exception as db_err:
-            app.logger.error(f"Database insert failed: {db_err}")
-
-        # -------------------------------
-
-        # -------------------------------
-        # Build HTTP link based on the session secret
-        # -------------------------------
-        try:
-            link_path = url_for("get_version", link=secret_link, _external=False)
-        except Exception as e:
-            # In case url_for is not available or fails, fall back to a relative path
-            app.logger.warning(f"url_for failed, falling back to manual link: {e}")
-            link_path = f"/api/get-version/{secret_link}"
-
-        # This payload satisfies both:
-        # the RMAP client, which needs the "result" field
-        # the course spec, which wants a link derived from the session secret
-        result_payload = {
-            "result": secret_link,
-            "link": link_path,
-        }
-
-        # -------------------------------
-        # Return encrypted or plaintext response
-        # -------------------------------
-        try:
-            if hasattr(rmap, "encrypt_for_identity"):
-                enc_response = rmap.encrypt_for_identity(identity, json.dumps(result_payload))
-                return jsonify({"payload": enc_response}), 200
-            else:
-                app.logger.warning("Encrypt reply failed, returning plaintext")
-                return jsonify(result_payload), 200
-        except Exception as e:
-            app.logger.warning(f"Encryption failed, returning plaintext: {e}")
-            return jsonify(result_payload), 200
-
-    except Exception as e:
-        app.logger.error(f"RMAP link generation error: {e}")
-        return jsonify({"error": f"RMAP link generation error: {e}"}), 400
-    # =========================
-    # User & Document routes
-    # =========================
     @app.post("/api/create-user")
     def create_user():
         payload = request.get_json(silent=True) or {}
@@ -340,10 +173,8 @@ def rmap_get_link():
         except IntegrityError:
             return jsonify({"error": "email or login already exists"}), 409
         except Exception as e:
-            app.logger.error(f"Database error during user creation: {e}")
             return jsonify({"error": f"database error: {str(e)}"}), 503
 
-        app.logger.info(f"New user created: {login}")
         return jsonify({"id": row.id, "email": row.email, "login": row.login}), 201
 
     @app.post("/api/login")
@@ -361,16 +192,21 @@ def rmap_get_link():
                     {"email": email},
                 ).first()
         except Exception as e:
-            app.logger.error(f"Database error during login: {e}")
             return jsonify({"error": f"database error: {str(e)}"}), 503
 
         if not row or not check_password_hash(row.hpassword, password):
-            app.logger.warning(f"Failed login attempt for {email}")
             return jsonify({"error": "invalid credentials"}), 401
 
         token = _serializer().dumps({"uid": int(row.id), "login": row.login, "email": row.email})
-        app.logger.info(f"User logged in: {email}")
-        return jsonify({"token": token, "token_type": "bearer", "expires_in": app.config["TOKEN_TTL_SECONDS"]}), 200
+        return jsonify(
+            {
+                "token": token,
+                "token_type": "bearer",
+                "expires_in": app.config["TOKEN_TTL_SECONDS"],
+            }
+        ), 200
+
+    # --- Document upload and listing ---
 
     @app.post("/api/upload-document")
     @require_auth
@@ -382,6 +218,7 @@ def rmap_get_link():
             return jsonify({"error": "empty filename"}), 400
 
         fname = file.filename
+
         user_dir = app.config["STORAGE_DIR"] / "files" / g.user["login"]
         user_dir.mkdir(parents=True, exist_ok=True)
 
@@ -421,13 +258,15 @@ def rmap_get_link():
         except Exception as e:
             return jsonify({"error": f"database error: {str(e)}"}), 503
 
-        return jsonify({
-            "id": int(row.id),
-            "name": row.name,
-            "creation": row.creation.isoformat() if hasattr(row.creation, "isoformat") else str(row.creation),
-            "sha256": row.sha256_hex,
-            "size": int(row.size),
-        }), 201
+        return jsonify(
+            {
+                "id": int(row.id),
+                "name": row.name,
+                "creation": row.creation.isoformat() if hasattr(row.creation, "isoformat") else str(row.creation),
+                "sha256": row.sha256_hex,
+                "size": int(row.size),
+            }
+        ), 201
 
     @app.get("/api/list-documents")
     @require_auth
@@ -446,14 +285,19 @@ def rmap_get_link():
         except Exception as e:
             return jsonify({"error": f"database error: {str(e)}"}), 503
 
-        docs = [{
-            "id": int(r.id),
-            "name": r.name,
-            "creation": r.creation.isoformat() if hasattr(r.creation, "isoformat") else str(r.creation),
-            "sha256": r.sha256_hex,
-            "size": int(r.size),
-        } for r in rows]
+        docs = [
+            {
+                "id": int(r.id),
+                "name": r.name,
+                "creation": r.creation.isoformat() if hasattr(r.creation, "isoformat") else str(r.creation),
+                "sha256": r.sha256_hex,
+                "size": int(r.size),
+            }
+            for r in rows
+        ]
         return jsonify({"documents": docs}), 200
+
+    # --- Version listing ---
 
     @app.get("/api/list-versions")
     @app.get("/api/list-versions/<int:document_id>")
@@ -481,14 +325,17 @@ def rmap_get_link():
         except Exception as e:
             return jsonify({"error": f"database error: {str(e)}"}), 503
 
-        versions = [{
-            "id": int(r.id),
-            "documentid": int(r.documentid),
-            "link": r.link,
-            "intended_for": r.intended_for,
-            "secret": r.secret,
-            "method": r.method,
-        } for r in rows]
+        versions = [
+            {
+                "id": int(r.id),
+                "documentid": int(r.documentid),
+                "link": r.link,
+                "intended_for": r.intended_for,
+                "secret": r.secret,
+                "method": r.method,
+            }
+            for r in rows
+        ]
         return jsonify({"versions": versions}), 200
 
     @app.get("/api/list-all-versions")
@@ -509,14 +356,19 @@ def rmap_get_link():
         except Exception as e:
             return jsonify({"error": f"database error: {str(e)}"}), 503
 
-        versions = [{
-            "id": int(r.id),
-            "documentid": int(r.documentid),
-            "link": r.link,
-            "intended_for": r.intended_for,
-            "method": r.method,
-        } for r in rows]
+        versions = [
+            {
+                "id": int(r.id),
+                "documentid": int(r.documentid),
+                "link": r.link,
+                "intended_for": r.intended_for,
+                "method": r.method,
+            }
+            for r in rows
+        ]
         return jsonify({"versions": versions}), 200
+
+    # --- Get document and version contents ---
 
     @app.get("/api/get-document")
     @app.get("/api/get-document/<int:document_id>")
@@ -547,6 +399,11 @@ def rmap_get_link():
             return jsonify({"error": "document not found"}), 404
 
         file_path = Path(row.path)
+        try:
+            file_path.resolve().relative_to(app.config["STORAGE_DIR"].resolve())
+        except Exception:
+            return jsonify({"error": "document path invalid"}), 500
+
         if not file_path.exists():
             return jsonify({"error": "file missing on disk"}), 410
 
@@ -554,59 +411,60 @@ def rmap_get_link():
             file_path,
             mimetype="application/pdf",
             as_attachment=False,
-            download_name=row.name if str(row.name).lower().endswith(".pdf") else f"{row.name}.pdf",
+            download_name=row.name if row.name.lower().endswith(".pdf") else f"{row.name}.pdf",
             conditional=True,
+            max_age=0,
+            last_modified=file_path.stat().st_mtime,
         )
         if isinstance(row.sha256_hex, str) and row.sha256_hex:
             resp.set_etag(row.sha256_hex.lower())
+
         resp.headers["Cache-Control"] = "private, max-age=0, must-revalidate"
         return resp
 
     @app.get("/api/get-version/<link>")
     def get_version(link: str):
-        # Try DB record first
         try:
             with get_engine().connect() as conn:
                 row = conn.execute(
-                    text("SELECT link, path FROM Versions WHERE link = :link LIMIT 1"),
+                    text("""
+                        SELECT *
+                        FROM Versions
+                        WHERE link = :link
+                        LIMIT 1
+                    """),
                     {"link": link},
                 ).first()
-        except Exception:
-            row = None
+        except Exception as e:
+            return jsonify({"error": f"database error: {str(e)}"}), 503
 
-        if row:
-            file_path = Path(row.path)
-        else:
-            # Fallback: look in downloads
-            download_dir = Path("/home/lab/Tatou-2/tatou/downloads")
-            matches = list(download_dir.glob(f"*_{link}.pdf"))
-            file_path = matches[0] if matches else None
-
-        if not file_path or not file_path.exists():
+        if not row:
             return jsonify({"error": "document not found"}), 404
 
-        return send_file(
+        file_path = Path(row.path)
+
+        try:
+            file_path.resolve().relative_to(app.config["STORAGE_DIR"].resolve())
+        except Exception:
+            return jsonify({"error": "document path invalid"}), 500
+
+        if not file_path.exists():
+            return jsonify({"error": "file missing on disk"}), 410
+
+        resp = send_file(
             file_path,
             mimetype="application/pdf",
             as_attachment=False,
-            download_name=file_path.name,
+            download_name=row.link if row.link.lower().endswith(".pdf") else f"{row.link}.pdf",
             conditional=True,
+            max_age=0,
+            last_modified=file_path.stat().st_mtime,
         )
 
-    # =========================
-    # Safe path helper
-    # =========================
-    def _safe_resolve_under_storage(p: str, storage_root: Path) -> Path:
-        storage_root = storage_root.resolve()
-        fp = Path(p)
-        if not fp.is_absolute():
-            fp = storage_root / fp
-        fp = fp.resolve()
-        try:
-            fp.relative_to(storage_root)
-        except Exception:
-            raise RuntimeError(f"path {fp} escapes storage root {storage_root}")
-        return fp
+        resp.headers["Cache-Control"] = "private, max-age=0"
+        return resp
+
+    # --- Delete documents ---
 
     @app.route("/api/delete-document", methods=["DELETE", "POST"])
     @app.route("/api/delete-document/<document_id>", methods=["DELETE"])
@@ -617,14 +475,16 @@ def rmap_get_link():
                 or request.args.get("documentid")
                 or (request.is_json and (request.get_json(silent=True) or {}).get("id"))
             )
+
         try:
-            doc_id = int(document_id)
-        except (TypeError, ValueError):
+            doc_id = str(int(document_id))
+        except Exception:
             return jsonify({"error": "document id required"}), 400
 
         try:
             with get_engine().connect() as conn:
-                row = conn.execute(text("SELECT * FROM Documents WHERE id = :id"), {"id": doc_id}).first()
+                query = "SELECT * FROM Documents WHERE id = " + doc_id
+                row = conn.execute(text(query)).first()
         except Exception as e:
             return jsonify({"error": f"database error: {str(e)}"}), 503
 
@@ -643,7 +503,12 @@ def rmap_get_link():
                     file_deleted = True
                 except Exception as e:
                     delete_error = f"failed to delete file: {e}"
-                    app.logger.warning("Failed to delete file %s for doc id=%s: %s", fp, row.id, e)
+                    app.logger.warning(
+                        "Failed to delete file %s for doc id=%s: %s",
+                        fp,
+                        row.id,
+                        e,
+                    )
             else:
                 file_missing = True
         except RuntimeError as e:
@@ -656,13 +521,17 @@ def rmap_get_link():
         except Exception as e:
             return jsonify({"error": f"database error during delete: {str(e)}"}), 503
 
-        return jsonify({
-            "deleted": True,
-            "id": doc_id,
-            "file_deleted": file_deleted,
-            "file_missing": file_missing,
-            "note": delete_error,
-        }), 200
+        return jsonify(
+            {
+                "deleted": True,
+                "id": doc_id,
+                "file_deleted": file_deleted,
+                "file_missing": file_missing,
+                "note": delete_error,
+            }
+        ), 200
+
+    # --- Watermark creation and reading ---
 
     @app.post("/api/create-watermark")
     @app.post("/api/create-watermark/<int:document_id>")
@@ -692,7 +561,12 @@ def rmap_get_link():
         try:
             with get_engine().connect() as conn:
                 row = conn.execute(
-                    text("SELECT id, name, path FROM Documents WHERE id = :id LIMIT 1"),
+                    text("""
+                        SELECT id, name, path
+                        FROM Documents
+                        WHERE id = :id
+                        LIMIT 1
+                    """),
                     {"id": doc_id},
                 ).first()
         except Exception as e:
@@ -714,23 +588,19 @@ def rmap_get_link():
             return jsonify({"error": "file missing on disk"}), 410
 
         try:
-            applicable = WMUtils.is_watermarking_applicable(
-                method=method,
-                pdf=str(file_path),
-                position=position
-            )
+            applicable = WMUtils.is_watermarking_applicable(method=method, pdf=str(file_path), position=position)
             if applicable is False:
                 return jsonify({"error": "watermarking method not applicable"}), 400
         except Exception as e:
             return jsonify({"error": f"watermark applicability check failed: {e}"}), 400
 
         try:
-            wm_bytes: bytes = WMUtils.apply_watermark(
+            wm_bytes = WMUtils.apply_watermark(
                 pdf=str(file_path),
                 secret=secret,
                 key=key,
                 method=method,
-                position=position
+                position=position,
             )
             if not isinstance(wm_bytes, (bytes, bytearray)) or len(wm_bytes) == 0:
                 return jsonify({"error": "watermarking produced no output"}), 500
@@ -767,7 +637,7 @@ def rmap_get_link():
                         "secret": secret,
                         "method": method,
                         "position": position or "",
-                        "path": str(dest_path)
+                        "path": str(dest_path),
                     },
                 )
                 vid = int(conn.execute(text("SELECT LAST_INSERT_ID()")).scalar())
@@ -778,22 +648,41 @@ def rmap_get_link():
                 pass
             return jsonify({"error": f"database error during version insert: {e}"}), 503
 
-        return jsonify({
-            "id": vid,
-            "documentid": doc_id,
-            "link": link_token,
-            "intended_for": intended_for,
-            "method": method,
-            "position": position,
-            "filename": candidate,
-            "size": len(wm_bytes),
-        }), 201
+        return jsonify(
+            {
+                "id": vid,
+                "documentid": doc_id,
+                "link": link_token,
+                "intended_for": intended_for,
+                "method": method,
+                "position": position,
+                "filename": candidate,
+                "size": len(wm_bytes),
+            }
+        ), 201
+
+    # GET /api/get-watermarking-methods -> {"methods":[{"name":..., "description":...}, ...], "count":N}
+    @app.get("/api/get-watermarking-methods")
+    def get_watermarking_methods():
+        methods = []
+        for m in WMUtils.METHODS:
+            methods.append(
+                {"name": m, "description": WMUtils.get_method(m).get_usage()}
+            )
+        return jsonify({"methods": methods, "count": len(methods)}), 200
 
     @app.post("/api/load-plugin")
     @require_auth
     def load_plugin():
+        """
+        Load a serialized Python class implementing WatermarkingMethod from
+        STORAGE_DIR/files/plugins/<filename>.{pkl|dill} and register it in WMUtils.METHODS.
+        Body: { "filename": "MyMethod.pkl", "overwrite": false }
+        """
         payload = request.get_json(silent=True) or {}
         filename = (payload.get("filename") or "").strip()
+        overwrite = bool(payload.get("overwrite", False))
+
         if not filename:
             return jsonify({"error": "filename is required"}), 400
 
@@ -814,10 +703,16 @@ def rmap_get_link():
         except Exception as e:
             return jsonify({"error": f"failed to deserialize plugin: {e}"}), 400
 
-        cls = obj if isinstance(obj, type) else obj.__class__
+        if isinstance(obj, type):
+            cls = obj
+        else:
+            cls = obj.__class__
+
         method_name = getattr(cls, "name", getattr(cls, "__name__", None))
         if not method_name or not isinstance(method_name, str):
-            return jsonify({"error": "plugin class must define a readable name"}), 400
+            return jsonify(
+                {"error": "plugin class must define a readable name (class.__name__ or .name)"}
+            ), 400
 
         has_api = all(hasattr(cls, attr) for attr in ("add_watermark", "read_secret"))
         if WatermarkingMethod is not None:
@@ -825,22 +720,366 @@ def rmap_get_link():
         else:
             is_ok = has_api
         if not is_ok:
-            return jsonify({"error": "plugin does not implement WatermarkingMethod API"}), 400
+            return jsonify(
+                {"error": "plugin does not implement WatermarkingMethod API (add_watermark/read_secret)"}
+            ), 400
 
+        # Register the class (not an instance) so you can instantiate as needed later
         WMUtils.METHODS[method_name] = cls()
 
-        return jsonify({
-            "loaded": True,
-            "filename": filename,
-            "registered_as": method_name,
-            "class_qualname": f"{getattr(cls, '__module__', '?')}.{getattr(cls, '__qualname__', cls.__name__)}",
-            "methods_count": len(WMUtils.METHODS)
-        }), 201
+        return jsonify(
+            {
+                "loaded": True,
+                "filename": filename,
+                "registered_as": method_name,
+                "class_qualname": f"{getattr(cls, '__module__', '?')}."
+                f"{getattr(cls, '__qualname__', cls.__name__)}",
+                "methods_count": len(WMUtils.METHODS),
+            }
+        ), 201
+
+    @app.post("/api/read-watermark")
+    @app.post("/api/read-watermark/<int:document_id>")
+    @require_auth
+    def read_watermark(document_id: int | None = None):
+        if not document_id:
+            document_id = (
+                request.args.get("id")
+                or request.args.get("documentid")
+                or (request.is_json and (request.get_json(silent=True) or {}).get("id"))
+            )
+        try:
+            doc_id = document_id
+        except (TypeError, ValueError):
+            return jsonify({"error": "document id required"}), 400
+
+        payload = request.get_json(silent=True) or {}
+        method = payload.get("method")
+        position = payload.get("position") or None
+        key = payload.get("key")
+
+        try:
+            doc_id = int(doc_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "document_id (int) is required"}), 400
+        if not method or not isinstance(key, str):
+            return jsonify({"error": "method, and key are required"}), 400
+
+        try:
+            with get_engine().connect() as conn:
+                row = conn.execute(
+                    text("""
+                        SELECT id, name, path
+                        FROM Documents
+                        WHERE id = :id
+                    """),
+                    {"id": doc_id},
+                ).first()
+        except Exception as e:
+            return jsonify({"error": f"database error: {str(e)}"}), 503
+
+        if not row:
+            return jsonify({"error": "document not found"}), 404
+
+        storage_root = Path(app.config["STORAGE_DIR"]).resolve()
+        file_path = Path(row.path)
+        if not file_path.is_absolute():
+            file_path = storage_root / file_path
+        file_path = file_path.resolve()
+        try:
+            file_path.relative_to(storage_root)
+        except ValueError:
+            return jsonify({"error": "document path invalid"}), 500
+        if not file_path.exists():
+            return jsonify({"error": "file missing on disk"}), 410
+
+        try:
+            secret = WMUtils.read_watermark(method=method, pdf=str(file_path), key=key)
+        except Exception as e:
+            return jsonify({"error": f"Error when attempting to read watermark: {e}"}), 400
+        return jsonify(
+            {
+                "documentid": doc_id,
+                "secret": secret,
+                "method": method,
+                "position": position,
+            }
+        ), 201
+
+    # -------- RMAP helpers --------
+
+    _rmap_obj = None
+    _rmap_idm = None
+
+    def _rmap_available() -> bool:
+        return bool(app.config.get("RMAP_ENABLE", False))
+
+    def _get_rmap():
+        nonlocal _rmap_obj, _rmap_idm
+
+        if _rmap_obj is not None and _rmap_idm is not None:
+            return _rmap_obj, _rmap_idm
+
+        try:
+            from rmap.identity_manager import IdentityManager
+            from rmap.rmap import RMAP
+        except Exception as e:
+            raise RuntimeError(f"RMAP library not available: {e}")
+
+        clients_dir = Path(app.config["RMAP_CLIENT_KEYS_DIR"]).resolve()
+        server_priv = Path(app.config["RMAP_SERVER_PRIV"]).resolve()
+        server_pub = Path(app.config["RMAP_SERVER_PUB"]).resolve()
+
+        if not clients_dir.exists():
+            raise RuntimeError(f"RMAP clients dir not found: {clients_dir}")
+
+        if not server_priv.exists() or not server_pub.exists():
+            raise RuntimeError("RMAP server keypair not found")
+
+        _idm = IdentityManager(
+            client_keys_dir=str(clients_dir),
+            server_public_key_path=str(server_pub),
+            server_private_key_path=str(server_priv),
+            server_private_key_passphrase=app.config.get("RMAP_SERVER_PRIV_PASSPHRASE"),
+        )
+
+        _rmap_idm = _idm
+        _rmap_obj = RMAP(_idm)
+        return _rmap_obj, _rmap_idm
+
+    # -------- RMAP endpoints --------
+
+    @app.post("/api/rmap-initiate")
+    def rmap_initiate():
+        if not _rmap_available():
+            return jsonify({"error": "RMAP disabled"}), 404
+
+        payload_b64 = (request.get_json(silent=True) or {}).get("payload")
+        if not payload_b64 or not isinstance(payload_b64, str):
+            return jsonify({"error": "payload required"}), 400
+
+        try:
+            rmap, _ = _get_rmap()
+            res = rmap.handle_message1({"payload": payload_b64})
+
+            app.logger.info(
+                "rmap.message1",
+                extra={"result_keys": list(res.keys()) if isinstance(res, dict) else "non-dict"},
+            )
+
+            if isinstance(res, dict) and "payload" in res:
+                return jsonify({"payload": res["payload"]}), 200
+
+            if isinstance(res, dict) and "error" in res:
+                return jsonify(res), 400
+
+            return jsonify({"error": "unexpected RMAP response"}), 500
+
+        except Exception as e:
+            app.logger.error("rmap.initiate.error", extra={"error": str(e)})
+            return jsonify({"error": f"rmap initiation failed: {e}"}), 400
+
+    @app.post("/api/rmap-get-link")
+    def rmap_get_link():
+        if not _rmap_available():
+            return jsonify({"error": "RMAP disabled"}), 404
+
+        payload_b64 = (request.get_json(silent=True) or {}).get("payload")
+        if not payload_b64 or not isinstance(payload_b64, str):
+            return jsonify({"error": "payload required"}), 400
+
+        try:
+            rmap, idm = _get_rmap()
+            res = rmap.handle_message2({"payload": payload_b64})
+
+            if isinstance(res, dict) and "error" in res:
+                app.logger.info("rmap.message2.error", extra={"error": res.get("error")})
+                return jsonify(res), 400
+
+            if not (isinstance(res, dict) and "result" in res and isinstance(res["result"], str)):
+                app.logger.error("rmap.message2.unexpected", extra={"got": str(res)})
+                return jsonify({"error": "unexpected RMAP response"}), 500
+
+            result_hex = res["result"].lower()
+
+            # extract nonceServer by decrypting the payload, fallback to scanning rmap state
+            try:
+                obj = idm.decrypt_for_server(payload_b64)
+                nonce_server = int(obj.get("nonceServer"))
+            except Exception:
+                nonce_server = None
+
+            identity = None
+            try:
+                for ident, (_nc, ns) in dict(getattr(rmap, "nonces", {})).items():
+                    if nonce_server is not None and int(ns) == int(nonce_server):
+                        identity = ident
+                        break
+            except Exception:
+                identity = None
+
+            if identity is None:
+                identity = "unknown"
+
+            secret_hex = result_hex
+            link_token = result_hex
+
+            # Find base document that we will watermark per identity
+            doc_id_env = app.config.get("RMAP_DOCUMENT_ID")
+            if not doc_id_env:
+                return jsonify({"error": "RMAP_DOCUMENT_ID not configured"}), 500
+
+            try:
+                base_doc_id = int(doc_id_env)
+            except (TypeError, ValueError):
+                return jsonify({"error": "RMAP_DOCUMENT_ID must be an integer"}), 500
+
+            try:
+                with get_engine().connect() as conn:
+                    row = conn.execute(
+                        text("SELECT id, name, path FROM Documents WHERE id = :id LIMIT 1"),
+                        {"id": base_doc_id},
+                    ).first()
+            except Exception as e:
+                app.logger.error(
+                    "db.query.error",
+                    extra={"where": "rmap_get_link.select_doc", "error": str(e)},
+                )
+                return jsonify({"error": f"database error: {str(e)}"}), 503
+
+            if not row:
+                return jsonify({"error": "base document not found"}), 404
+
+            storage_root = Path(app.config["STORAGE_DIR"]).resolve()
+            file_path = Path(row.path)
+            if not file_path.is_absolute():
+                file_path = storage_root / file_path
+            file_path = file_path.resolve()
+
+            try:
+                file_path.relative_to(storage_root)
+            except ValueError:
+                app.logger.warning("path.escape.detected", extra={"path": str(file_path)})
+                return jsonify({"error": "document path invalid"}), 500
+
+            if not file_path.exists():
+                return jsonify({"error": "file missing on disk"}), 410
+
+            method = app.config.get("RMAP_WATERMARK_METHOD", "gulshan")
+            key = app.config.get("RMAP_WATERMARK_KEY", app.config["SECRET_KEY"])
+
+            try:
+                applicable = WMUtils.is_watermarking_applicable(
+                    method=method, pdf=str(file_path), position=None
+                )
+                if applicable is False:
+                    app.logger.info(
+                        "wm.inapplicable",
+                        extra={"method": method, "doc": str(file_path)},
+                    )
+                    return jsonify({"error": "configured watermarking method not applicable"}), 400
+            except Exception as e:
+                app.logger.error("wm.applicability.error", extra={"error": str(e)})
+                return jsonify(
+                    {"error": f"watermark applicability check failed: {e}"}
+                ), 400
+
+            try:
+                wm_bytes = WMUtils.apply_watermark(
+                    pdf=str(file_path),
+                    secret=secret_hex,
+                    key=str(key),
+                    method=str(method),
+                    position=None,
+                )
+                if not isinstance(wm_bytes, (bytes, bytearray)) or len(wm_bytes) == 0:
+                    return jsonify({"error": "watermarking produced no output"}), 500
+            except Exception as e:
+                app.logger.error("wm.apply.error", extra={"error": str(e)})
+                return jsonify({"error": f"watermarking failed: {e}"}), 500
+
+            base_name = Path(row.name or file_path.name).stem
+            intended_slug = secure_filename(str(identity) or "recipient")
+            dest_dir = file_path.parent / "watermarks"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            candidate = f"{base_name}__{intended_slug}.pdf"
+            dest_path = dest_dir / candidate
+
+            try:
+                with dest_path.open("wb") as f:
+                    f.write(wm_bytes)
+            except Exception as e:
+                app.logger.error(
+                    "fs.write.error", extra={"path": str(dest_path), "error": str(e)}
+                )
+                return jsonify(
+                    {"error": f"failed to write watermarked file: {e}"}
+                ), 500
+
+            try:
+                _ensure_wm_key_column()
+            except Exception:
+                pass
+
+            try:
+                with get_engine().begin() as conn:
+                    conn.execute(
+                        text(
+                            """
+                            INSERT INTO Versions (
+                                documentid, link, intended_for,
+                                secret, method, wm_key, position, path
+                            )
+                            VALUES (
+                                :documentid, :link, :intended_for,
+                                :secret, :method, :wm_key, :position, :path
+                            )
+                            """
+                        ),
+                        {
+                            "documentid": int(row.id),
+                            "link": link_token,
+                            "intended_for": str(identity),
+                            "secret": secret_hex,
+                            "method": str(method),
+                            "wm_key": str(key),
+                            "position": "",
+                            "path": str(dest_path),
+                        },
+                    )
+            except IntegrityError:
+                try:
+                    dest_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                app.logger.info("version.dup_link", extra={"link": link_token})
+                return jsonify({"error": "version link already exists"}), 409
+            except Exception as e:
+                try:
+                    dest_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                app.logger.error(
+                    "db.insert.error",
+                    extra={"table": "Versions", "error": str(e)},
+                )
+                return jsonify(
+                    {"error": f"database error during version insert: {e}"}
+                ), 503
+
+            app.logger.info(
+                "rmap.issued", extra={"identity": identity, "link": link_token}
+            )
+            return jsonify({"result": link_token, "link": url_for("get_version", link=link_token)}), 200
+
+        except Exception as e:
+            app.logger.error("rmap.get_link.error", extra={"error": str(e)})
+            return jsonify({"error": f"rmap get-link failed: {e}"}), 400
 
     return app
 
 
-# WSGI entry
+# WSGI entrypoint
 app = create_app()
 
 if __name__ == "__main__":
